@@ -24,6 +24,8 @@ from deep_sort import preprocessing, nn_matching
 from deep_sort.detection import Detection
 from deep_sort.tracker import Tracker
 from tools import generate_detections as gdet
+import math
+
 flags.DEFINE_string('framework', 'tf', '(tf, tflite, trt')
 flags.DEFINE_string('weights', './checkpoints/yolov4-416',
                     'path to weights file')
@@ -38,6 +40,7 @@ flags.DEFINE_float('score', 0.50, 'score threshold')
 flags.DEFINE_boolean('dont_show', False, 'dont show video output')
 flags.DEFINE_boolean('info', False, 'show detailed info of tracked objects')
 flags.DEFINE_boolean('count', False, 'count objects being tracked on screen')
+flags.DEFINE_boolean('speed', False, 'estimate speed of objects being tracked')
 
 # from https://github.com/theAIGuysCode/yolov4-custom-functions/blob/master/detect_video.py
 def read_class_names(class_file_name):
@@ -73,7 +76,18 @@ def count_objects(data, by_class = False, allowed_classes = list(read_class_name
     
     return counts
 
-
+# modified based on https://www.kaggle.com/code/koayhongvin/traffic-video-speed-detection/notebook
+def estimateSpeed(location1, location2,ppm=6.6,fps=7):
+    # use the midpoints of the two bboxes instead of the top left points, in attempt to stablize
+    # the position of the bbox 
+    midpoint1_x = location1[0] + location1[2]/2
+    midpoint2_x = location2[0] + location2[2]/2
+    midpoint1_y = location1[1] + location1[3]/2
+    midpoint2_y = location2[1] + location2[3]/2
+    d_pixels = math.sqrt(math.pow(midpoint2_x - midpoint1_x, 2) + math.pow(midpoint2_y - midpoint1_y, 2))
+    d_meters = d_pixels / ppm
+    speed = d_meters * fps * 3.6
+    return speed
 
 
 def main(_argv):
@@ -129,6 +143,9 @@ def main(_argv):
         out = cv2.VideoWriter(FLAGS.output, codec, fps, (width, height))
 
     frame_num = 0
+    carLocation1 = {}
+    carLocation2 = {}
+    speed = {}
     # while video is running
     while True:
         return_value, frame = vid.read()
@@ -244,12 +261,33 @@ def main(_argv):
         tracker.update(detections)
 
         # update tracks
-        print("tracker!", tracker.tracks)
         for track in tracker.tracks:
             if not track.is_confirmed() or track.time_since_update > 1:
                 continue 
-            bbox = track.to_tlbr()
+            bbox = track.to_tlbr() # to_tlwh: (top left x, top left y, width, height)
             class_name = track.get_class()
+            
+            if FLAGS.speed:
+                if frame_num <= 3:
+                    carLocation1[track.track_id] = bbox
+                carLocation2[track.track_id] = bbox
+                speed[track.track_id] = 0
+
+                for i in carLocation1.keys():	
+                    [x1, y1, w1, h1] = carLocation1[i]
+                    [x2, y2, w2, h2] = carLocation2[i]
+
+                    carLocation1[i] = [x2, y2, w2, h2]
+
+                    if [x1, y1, w1, h1] != [x2, y2, w2, h2]:
+                        # if it is in the lower part of the frame (y1>=300)
+                        if (speed[i] == None or speed[i] == 0) and y1 >= 300:
+                            speed[i] = estimateSpeed([x1, y1, w1, h1], [x2, y2, w2, h2])
+
+                        # only output the speed if it is > 5km/h and is in the lower part of the frame
+                        # and the bounding box is not too small across the two frames
+                        if speed[i] > 5 and y1 >= 180 and h1 > 100 and h2 > 100:
+                            cv2.putText(frame, class_name +"("+class_name+")" + str(i) + ": "+str(int(speed[i])) + " km/hr", (int(x2+15), int(y2-5)),cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
             
         # draw bbox on screen
             color = colors[int(track.track_id) % len(colors)]
